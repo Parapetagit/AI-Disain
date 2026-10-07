@@ -1,82 +1,50 @@
 import streamlit as st
 import streamlit.components.v1 as components
-from openai import OpenAI
 import os
 import json
 from dotenv import load_dotenv
 import base64
 
 # --- 1. БЕЗОПАСНАЯ ЗАГРУЗКА КЛЮЧА ---
+# Load dotenv BEFORE importing agents so the OpenAI client initializes correctly
 load_dotenv()
+
+from agents import AppraiserAgent, ArtDirectorAgent, ClerkAgent, SalesManagerAgent
 API_KEY = os.getenv("API_KEY")
 
 if not API_KEY:
     st.error("⚠️ Ключ не найден! Убедитесь, что создали файл .env с переменной API_KEY")
     st.stop()
 
-# --- 2. ПОДКЛЮЧЕНИЕ К RELAYMODELS ---
-client = OpenAI(
-    api_key=API_KEY,
-    base_url=os.getenv("BASE_URL", "https://api.relaymodels.com/v1")
-)
-MODEL_NAME = os.getenv("MODEL_NAME", "gemini-3.1-pro")
-
 st.set_page_config(page_title="AI Дизайнер Dantone Home", layout="wide")
 
-# --- 3. ЗАГРУЗКА ДАННЫХ ИЗ НАШЕЙ БАЗЫ (JSON) ---
+# --- 2. ЗАГРУЗКА ДАННЫХ ИЗ НАШЕЙ БАЗЫ (JSON) ---
+CATALOG_PATH = "catalog.json"
 try:
-    with open("catalog.json", "r", encoding="utf-8") as f:
+    with open(CATALOG_PATH, "r", encoding="utf-8") as f:
         catalog_data = json.load(f)
 except FileNotFoundError:
-    st.error("⚠️ Файл catalog.json не найден. Сначала запустите скрипт scraper.py!")
+    st.error(f"⚠️ Файл {CATALOG_PATH} не найден. Сначала запустите скрипт scraper.py!")
     st.stop()
 
-# Формируем текст каталога для ИИ
-CATALOG_TEXT = "КАТАЛОГ DANTONE HOME:\n"
-for item in catalog_data:
-    CATALOG_TEXT += f"Название: {item['name']}, Цена: {item['price']}, Ссылка на фото: {item['image']}\n"
-
-# --- 4. НАСТРОЙКИ ИИ (СИСТЕМНЫЙ ПРОМПТ ДЛЯ ВЫВОДА JSON) ---
-SYSTEM_PROMPT = f"""
-Ты официальный AI-дизайнер Dantone Home. 
-Твоя задача — общаться с клиентом и подбирать мебель.
-Выбирай позиции ТОЛЬКО из этого каталога:
-{CATALOG_TEXT}
-
-ВНИМАНИЕ! Ты должен отвечать СТРОГО в формате JSON. Никакого текста до или после JSON.
-Формат твоего ответа должен быть таким:
-{{
-  "reply_text": "Тут твой ответ клиенту, рассказ про мебель и итоговая цена...",
-  "selected_images": ["ссылка_на_фото_1", "ссылка_на_фото_2"]
-}}
-
-Если клиент просит добавить товар, добавь его ссылку в массив selected_images.
-Если клиент просит убрать товар, удали его ссылку из массива.
-Ссылки бери СТРОГО из каталога один в один.
-"""
+# --- 3. ИНИЦИАЛИЗАЦИЯ АГЕНТОВ ---
+appraiser = AppraiserAgent()
+art_director = ArtDirectorAgent()
+clerk = ClerkAgent(CATALOG_PATH)
+sales_manager = SalesManagerAgent()
 
 def encode_image(uploaded_file):
     return base64.b64encode(uploaded_file.getvalue()).decode('utf-8')
 
-# Вспомогательная функция для парсинга ответа ИИ
-def parse_ai_response(response_text):
-    try:
-        # Очищаем от возможных маркеров markdown (```json ... ```)
-        clean_text = response_text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(clean_text)
-        return data.get("reply_text", "Ответ сгенерирован."), data.get("selected_images", [])
-    except Exception as e:
-        return f"Обычный ответ: {response_text}", []
-
-# --- 5. КОМПОНЕНТ ИНТЕРАКТИВНОГО ХОЛСТА (DRAG & DROP) ---
+# --- 4. КОМПОНЕНТ ИНТЕРАКТИВНОГО ХОЛСТА (DRAG & DROP) ---
 def draggable_canvas(background_b64, items_urls):
     if not background_b64:
         return
         
     items_html = ""
     for url in items_urls:
-        if url: # CSS mix-blend-mode: multiply убирает белый фон (делает его прозрачным на светлых фото)
-            items_html += f'<img src="{url}" class="draggable" style="mix-blend-mode: multiply;">\n'
+        if url: # CSS mix-blend-mode: multiply убирает белый фон, но у нас уже вырезано с rembg, так что будет прозрачным!
+            items_html += f'<img src="{url}" class="draggable" style="mix-blend-mode: normal;">\n'
 
     html_code = f"""
     <!DOCTYPE html>
@@ -89,6 +57,7 @@ def draggable_canvas(background_b64, items_urls):
             border: 2px dashed #ccc;
             border-radius: 10px;
             overflow: hidden;
+            background-color: #f8f9fa;
         }}
         #bg-image {{
             width: 100%;
@@ -149,17 +118,19 @@ def draggable_canvas(background_b64, items_urls):
     """
     components.html(html_code, height=600)
 
-# --- 6. ПАМЯТЬ СЕССИИ ---
+# --- 5. ПАМЯТЬ СЕССИИ ---
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    st.session_state.messages = []
 if "bg_image_b64" not in st.session_state:
     st.session_state.bg_image_b64 = None
 if "current_items" not in st.session_state:
     st.session_state.current_items = []
+if "room_summary" not in st.session_state:
+    st.session_state.room_summary = None
 
-# --- 7. ИНТЕРФЕЙС САЙТА ---
+# --- 6. ИНТЕРФЕЙС САЙТА ---
 st.title("🛋️ AI Дизайнер Dantone Home (Virtual Staging)")
-st.caption(f"Интерактивный холст | Модель: {MODEL_NAME}")
+st.caption(f"Интерактивный холст с Мультиагентной системой | Модель: {os.getenv('MODEL_NAME', 'gemini-3.1-pro')}")
 
 # Делим экран: Слева Холст и Чат, Справа Настройки и Каталог
 col_main, col_sidebar = st.columns([2, 1])
@@ -168,10 +139,19 @@ with col_sidebar:
     st.subheader("📸 Шаг 1. Загрузите комнату")
     uploaded_file = st.file_uploader("Выберите фото вашей комнаты", type=['jpg', 'jpeg', 'png'])
     
-    if uploaded_file:
-        # Сохраняем фон в память
-        st.session_state.bg_image_b64 = encode_image(uploaded_file)
-        st.success("Фото загружено! Теперь напишите ИИ в чат.")
+    if uploaded_file and st.session_state.bg_image_b64 != encode_image(uploaded_file):
+        with st.spinner("Агент-Оценщик изучает вашу комнату... 👁️"):
+            b64_image = encode_image(uploaded_file)
+            st.session_state.bg_image_b64 = b64_image
+
+            # Agent 2: Appraiser analyzes the room
+            st.session_state.room_summary = appraiser.analyze_room(f"data:image/jpeg;base64,{b64_image}")
+
+        st.success("Фото загружено и проанализировано! Теперь напишите запрос в чат.")
+        st.info(f"**Анализ комнаты:**\n{st.session_state.room_summary}")
+
+    elif st.session_state.room_summary:
+        st.info(f"**Анализ комнаты:**\n{st.session_state.room_summary}")
     
     st.markdown("---")
     st.subheader("🛒 Актуальный ассортимент")
@@ -180,6 +160,7 @@ with col_sidebar:
             st.markdown(f"**{item['name']}**")
             st.write(f"💰 {item['price']}")
             if item['image']:
+                # Image can be base64 from rembg, which is nice and transparent!
                 st.image(item['image'], width=120)
             st.divider()
 
@@ -196,64 +177,38 @@ with col_main:
     
     # 2. Отрисовываем историю чата
     for msg in st.session_state.messages:
-        if msg["role"] == "system":
-            continue
-            
         role = msg["role"]
         content = msg["content"]
-        
-        # Разбираем сообщение для красивого отображения
-        if role == "user":
-            display_text = content[0]["text"] if isinstance(content, list) else content
-            st.chat_message("user").write(display_text)
-        elif role == "assistant":
-            # ИИ отвечает в JSON, поэтому мы парсим его текст для истории
-            reply_text, _ = parse_ai_response(content)
-            st.chat_message("assistant").write(reply_text)
+        st.chat_message(role).write(content)
 
     # 3. Ввод от пользователя
     user_input = st.chat_input("Напишите: 'Поставь сюда диван Ноттингем и кресло'...")
     
     if user_input:
-        # Формируем запрос
-        if uploaded_file:
-            user_msg_content = [
-                {"type": "text", "text": user_input},
-                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{st.session_state.bg_image_b64}"}}
-            ]
-        else:
-            user_msg_content = user_input
-
-        # Добавляем вопрос пользователя в память и на экран
-        st.session_state.messages.append({"role": "user", "content": user_msg_content})
+        st.session_state.messages.append({"role": "user", "content": user_input})
         st.chat_message("user").write(user_input)
 
-        # Отправляем запрос к ИИ
         with st.chat_message("assistant"):
-            with st.spinner("Анализирую интерьер, расставляю мебель..."):
-                try:
-                    response = client.chat.completions.create(
-                        model=MODEL_NAME,
-                        messages=st.session_state.messages,
-                        max_tokens=1500,
-                        response_format={"type": "json_object"}
-                    )
+            if not st.session_state.room_summary:
+                st.warning("Пожалуйста, сначала загрузите фотографию комнаты!")
+            else:
+                with st.spinner("Арт-Директор думает над концепцией... 🧠"):
+                    search_query = art_director.formulate_query(user_input, st.session_state.room_summary)
+                    st.write(f"*(Внутреннее ТЗ: {search_query})*")
+
+                with st.spinner("Агент-Кладовщик ищет идеальную мебель... 🔎"):
+                    selected_items = clerk.find_items(search_query)
+
+                with st.spinner("Менеджер по продажам готовит ответ... 💼"):
+                    final_response = sales_manager.generate_response(user_input, selected_items)
                     
-                    ai_answer_raw = response.choices[0].message.content
+                    reply_text = final_response.get("reply_text", "Готово!")
+                    selected_images = final_response.get("selected_images", [])
                     
-                    # Записываем сырой JSON-ответ ИИ в историю (чтобы ИИ помнил свой JSON)
-                    st.session_state.messages.append({"role": "assistant", "content": ai_answer_raw})
-                    
-                    # Парсим ответ
-                    reply_text, selected_images = parse_ai_response(ai_answer_raw)
-                    
-                    # Обновляем ссылки на мебель в памяти
+                    st.session_state.messages.append({"role": "assistant", "content": reply_text})
                     st.session_state.current_items = selected_images
                     
                     st.write(reply_text)
                     
                     # ПЕРЕЗАГРУЖАЕМ СТРАНИЦУ, чтобы обновить Холст!
                     st.rerun()
-                
-                except Exception as e:
-                    st.error(f"Ошибка API: {e}")
